@@ -1,0 +1,36 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "minisys-assembler Build with Makefile",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/assembler", // 你的可执行文件名
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "gdb", // 如果在 macOS 上，可以改为 "lldb"
+      "miDebuggerArgs": "-x ${env:HOME}/.gdbinit",
+      "preLaunchTask": "minisys-assembler Build with Makefile", // 与 tasks.json 中的 label 对应
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Skip C++ standard library files",
+          "text": "skip file /usr/include/c++/*",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Skip GCC's libstdc++ files",
+          "text": "skip file */libstdc++/*",
+          "ignoreFailures": true
+        }
+      ],
+    }
+  ]
+}

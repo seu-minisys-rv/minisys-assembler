@@ -1,0 +1,1251 @@
+现在有个问题,目前assembler主干是一次遍历：
+void Assembler::firstPass()
+{
+  initializeSegments();
+
+  for (const auto &line : lines)
+  {
+    if (line.back() == ':')
+    { // 处理标签
+      std::string label = line.substr(0, line.size() - 1);
+      symbolTable.addSymbol(label, address, SymbolType::LABEL);
+    }
+    else if (line[0] == '.')
+    { // 处理伪指令
+      std::istringstream iss(line);
+      std::string directive;
+      iss >> directive;
+      if (directive == ".type")
+      {
+        handleTypeDirective(iss, currentSecName, address);
+      }
+      else if (directive == ".globl")
+      {
+        handleGloblDirective(iss);
+      }
+      else if (directive == ".section")
+      {
+        handleSectionDirective(iss, currentSecName, address);
+      }
+      else if (directive == ".p2align")
+      {
+        handleP2AlignDirective(iss, address, currentSecName);
+      }
+      else if (directive == ".size")
+      {
+        handleSizeDirective(iss, currentSecName);
+      }
+      else if (directive == ".word")
+      {
+        handleWordDirective(iss, currentSecName, address);
+      }
+    }
+    else
+    {
+      handleInstruction(line, currentSecName, address);
+    }
+  }
+}
+对于J型等指令来说，只一次遍历可能无法确定label是否是外部指令，所以在目前的是线上需要增加二次遍历。然而第一次遍历通过sectionname确定section的归属，第二次遍历也需要这样。若第二次遍历只需要处理instruction，是否可以设一个{secname:vector<instruction（string）>},供第二次遍历使用？这其中，重定位项怎么处理呢，section和segment是否正确处理了，请提供你的实现
+
+目前处理重定位是在instruction模块中实现的：
+void Assembler::handleInstruction(const std::string &line, const std::string &currentSecName, uint32_t &address)
+{
+  // 使用 Instruction 工厂方法解析并创建指令对象
+  auto instruction = Instruction::create(line);
+
+  // 编码指令，生成机器码
+  uint32_t machineCode = instruction->encode(symbolTable, address);
+
+  // 将机器码添加到当前节的数据
+  sectionTable[currentSecName].addInstruction(machineCode);
+
+  // 更新地址（指令为 4 字节，因此地址增加 4）
+  address += 4;
+}
+uint32_t InstructionJ::encode(const SymbolTable &symbolTable, uint32_t currentAddress)
+{
+  // 获取操作码
+  auto opcodeIt = opcodeMap.find(opcode);
+  if (opcodeIt == opcodeMap.end())
+  {
+    throw std::runtime_error("Unsupported J-type instruction: " + opcode);
+  }
+  uint32_t opcodeVal = opcodeIt->second;
+
+  // 检查标签是否在符号表中
+  bool isInternal = symbolTable.hasSymbol(label);
+  int32_t imm = 0;
+
+  if (isInternal)
+  {
+    // 计算内部符号的偏移量
+    uint32_t labelAddress = symbolTable.getSymbol(label).address;
+    imm = static_cast<int32_t>(labelAddress - currentAddress);
+
+    // 检查立即数是否对齐到 4 字节
+    if (imm % 4 != 0)
+    {
+      throw std::runtime_error("Jump target address must be 4-byte aligned.");
+    }
+
+    // 确保立即数在 20 位范围内
+    if (imm < -(1 << 19) || imm >= (1 << 20))
+    {
+      throw std::runtime_error("Jump offset out of range for J-type instruction: " + std::to_string(imm));
+    }
+  }
+  else
+  {
+    // 外部符号，添加到重定位表并将偏移量设为 0
+    g_relocationTable.addRelocation(currentAddress, label, RelocationType::Jump);
+  }
+
+  uint32_t imm20 = (imm >> 20) & 0x1;     // imm[20]
+  uint32_t imm10_1 = (imm >> 1) & 0x3FF;  // imm[10:1]
+  uint32_t imm11 = (imm >> 11) & 0x1;     // imm[11]
+  uint32_t imm19_12 = (imm >> 12) & 0xFF; // imm[19:12]
+
+  // 组装指令
+  uint32_t instruction = 0;
+  instruction |= (imm20 & 0x1) << 31;     // imm[20]: bit 31
+  instruction |= (imm19_12 & 0xFF) << 12; // imm[19:12]: bits 12-19
+  instruction |= (imm11 & 0x1) << 20;     // imm[11]: bit 20
+  instruction |= (imm10_1 & 0x3FF) << 21; // imm[10:1]: bits 21-30
+  instruction |= (rd & 0x1F) << 7;        // rd: bits 7-11
+  instruction |= (opcodeVal & 0x7F);      // opcode: bits 0-6
+
+  return instruction;
+}
+
+
+你搞错了一点，section是人为设置的分段，如：
+	.type	sa,@object                      
+	.section	.sdata,"aw",@progbits
+	.globl	sa
+	.p2align	2, 0x0
+sa:
+	.word	100                           
+	.size	sa, 4
+
+  .type	se,@object                   
+	.section	.sdata,"aw",@progbits
+	.globl	se
+	.p2align	2, 0x0
+se:
+	.word	10                           
+	.size	se, 4
+分为两个section，一个是sa，一个是se，而segment是实际的划分，他们都属于.sdata
+
+
+一步一步来，请判断我目前的修改是否正确。
+1.我修改了Section的成员变量，增添了section及地址baseAddress，基地址是否应在创建section时，即读到.type时设置，即baseAddress=address。
+2.我设置了供第二次遍历的指令表  std::unordered_map<std::string, std::vector<std::pair<int, std::string>>> instructionTable 并在第一次遍历中这样设置：
+std::pair<int, std::string> instrucionPair = std::make_pair(address, line);
+instructionTable[currentSecName].emplace_back(instrucionPair);
+address += 4;
+这样在第二次遍历中，计算位置时会不会有所改进?
+请分析这些做法，并给出接下来我要怎么做
+
+我的想法是，在firstpass中，address仍然按照全局的方法设置，symbol，instruction的地址仍然先按照全局设置。增设secSymbol映射：{secName:vector<symbolname>}在symbol中增设segname，标明所属，方便secondpass分辨是否在同一个section，如下：
+// 符号结构
+struct Symbol
+{
+  std::string name;                        // 符号名称
+  uint32_t address = 0;                    // 符号地址
+  SymbolType type = SymbolType::UNDEFINED; // 符号类型，默认为 UNDEFINED
+  bool isGlobal = false;                   // 是否为全局符号
+  int size = 0;                            // 符号大小，默认为 0
+  std::string secName;                 // 符号所在section的名称
+};
+这样可以处理：.size	main, .Lfunc_end1-main
+第一次遍历后处理address，以segmentTable[.text]为例，遍历其中的section，将第一个section的baseaddr设置为0，指令addr可不变（因为是第一个），后续section的baseaddr设置为前一个section的baseaddr+size。对每个section，遍历instructionTable[currentSecName],将其中的每个指令的addr减去上一个section的size，再遍历secSymbol[secname],获取symbol的name，映射到symboltable，将其中的addr减去上一个section的add。
+请问这样的作法是否可行，有什么问题，有什么需要注意的地方。
+
+下面是指令encode的实现，目前重定位的修改是否正确，addend 是目标分支地址与当前指令地址之间的偏移，但是这种偏移是不是跨section了呢，本身违背了计算section内地址的思想呢，希望你能给出解释。同时relocationtype的作用是什么，enum是否能对应到elf中，同时分不太清B型指令该用哪个，伪指令将其转换为实际指令，是否有些type就不需要了。同时我注意到一些类型的指令译码并不完善，似乎没有处理带百分号的情况
+B型：
+uint32_t InstructionB::encode(const SymbolTable &symbolTable, RelocationTable &relocationTable, uint32_t currentAddress, std::string currentSecName)
+{
+  uint32_t opcodeVal = 0x63; // B 型指令的 opcode 固定为 0x63
+
+  // 获取 funct3
+  auto funct3It = funct3Map.find(opcode);
+  if (funct3It == funct3Map.end())
+  {
+    throw std::runtime_error("Unsupported B-type funct3 for opcode: " + opcode);
+  }
+  uint32_t funct3 = funct3It->second;
+
+  // 检查标签是否在符号表中
+  bool isInternal = symbolTable.hasSymbol(label);
+  int32_t imm_shifted = 0;
+
+  if (symbolTable.hasSymbol(label) && currentSecName == symbolTable.getSectionName(label))
+  {
+    // 计算内部符号的偏移量
+    uint32_t labelAddress = symbolTable.getSymbol(label).saddress;
+    imm = static_cast<int32_t>(labelAddress - currentAddress);
+
+    if (imm % 2 != 0)
+    {
+      throw std::runtime_error("Branch target address must be 2-byte aligned.");
+    }
+
+    imm_shifted = imm >> 1;
+
+    if (imm_shifted < -2048 || imm_shifted > 2047)
+    {
+      throw std::runtime_error("Branch offset out of range.");
+    }
+  }
+  else
+  {
+    // 外部符号，添加到重定位表并将偏移量设为0
+    relocationTable.addRelocation(currentAddress, label, RelocationType::R_RISCV_BRANCH);
+  }
+
+  // 将立即数分割为各个部分
+  uint32_t imm12 = (imm_shifted >> 11) & 0x1;   // imm[12]
+  uint32_t imm10_5 = (imm_shifted >> 5) & 0x3F; // imm[10:5]
+  uint32_t imm4_1 = (imm_shifted >> 1) & 0xF;   // imm[4:1]
+  uint32_t imm11 = (imm_shifted >> 10) & 0x1;   // imm[11]
+
+  // 组装指令
+  uint32_t instruction = 0;
+  instruction |= (imm12 & 0x1) << 31;    // imm[12]: bit 31
+  instruction |= (imm10_5 & 0x3F) << 25; // imm[10:5]: bits 25-30
+  instruction |= (rs2 & 0x1F) << 20;     // rs2: bits 20-24
+  instruction |= (rs1 & 0x1F) << 15;     // rs1: bits 15-19
+  instruction |= (funct3 & 0x7) << 12;   // funct3: bits 12-14
+  instruction |= (imm4_1 & 0xF) << 8;    // imm[4:1]: bits 8-11
+  instruction |= (imm11 & 0x1) << 7;     // imm[11]: bit 7
+  instruction |= (opcodeVal & 0x7F);     // opcode: bits 0-6
+
+  return instruction;
+}
+J型：
+uint32_t InstructionJ::encode(const SymbolTable &symbolTable, RelocationTable &relocationTable, uint32_t currentAddress, std::string currentSecName)
+{
+  // 获取操作码
+  auto opcodeIt = opcodeMap.find(opcode);
+  if (opcodeIt == opcodeMap.end())
+  {
+    throw std::runtime_error("Unsupported J-type instruction: " + opcode);
+  }
+  uint32_t opcodeVal = opcodeIt->second;
+
+  // 检查标签是否在符号表中
+  bool isInternal = symbolTable.hasSymbol(label);
+  int32_t imm = 0;
+
+  if (isInternal)
+  {
+    // 计算内部符号的偏移量
+    uint32_t labelAddress = symbolTable.getSymbol(label).saddress;
+    imm = static_cast<int32_t>(labelAddress - currentAddress);
+
+    // 检查立即数是否对齐到 4 字节
+    if (imm % 4 != 0)
+    {
+      throw std::runtime_error("Jump target address must be 4-byte aligned.");
+    }
+
+    // 确保立即数在 20 位范围内
+    if (imm < -(1 << 19) || imm >= (1 << 20))
+    {
+      throw std::runtime_error("Jump offset out of range for J-type instruction: " + std::to_string(imm));
+    }
+  }
+  else
+  {
+    // 外部符号，添加到重定位表并将偏移量设为 0
+    relocationTable.addRelocation(currentAddress, label, RelocationType::R_RISCV_JAL);
+  }
+
+  uint32_t imm20 = (imm >> 20) & 0x1;     // imm[20]
+  uint32_t imm10_1 = (imm >> 1) & 0x3FF;  // imm[10:1]
+  uint32_t imm11 = (imm >> 11) & 0x1;     // imm[11]
+  uint32_t imm19_12 = (imm >> 12) & 0xFF; // imm[19:12]
+
+  // 组装指令
+  uint32_t instruction = 0;
+  instruction |= (imm20 & 0x1) << 31;     // imm[20]: bit 31
+  instruction |= (imm19_12 & 0xFF) << 12; // imm[19:12]: bits 12-19
+  instruction |= (imm11 & 0x1) << 20;     // imm[11]: bit 20
+  instruction |= (imm10_1 & 0x3FF) << 21; // imm[10:1]: bits 21-30
+  instruction |= (rd & 0x1F) << 7;        // rd: bits 7-11
+  instruction |= (opcodeVal & 0x7F);      // opcode: bits 0-6
+
+  return instruction;
+}
+
+伪指令：
+uint32_t InstructionP::encode(const SymbolTable &symbolTable, RelocationTable &relocationTable, uint32_t currentAddress, std::string currentSecName)
+{
+  if (expandedOpcode == "addi")
+  {
+    uint32_t rd = Utils::getRegisterNumber(expandedOperands[0]);
+    uint32_t rs1 = Utils::getRegisterNumber(expandedOperands[1]);
+    int32_t imm = Utils::stringToImmediate(expandedOperands[2]);
+
+    return (0x13 | (rd << 7) | (0x0 << 12) | (rs1 << 15) | ((imm & 0xFFF) << 20));
+  }
+  else if (expandedOpcode == "jal")
+  {
+    uint32_t rd = Utils::getRegisterNumber(expandedOperands[0]);
+    std::string label = expandedOperands[1];
+    int32_t imm = 0;
+
+    if (symbolTable.hasSymbol(label))
+    {
+      // 计算内部符号的偏移量
+      uint32_t labelAddress = symbolTable.getSymbol(label).saddress;
+      imm = static_cast<int32_t>(labelAddress - currentAddress);
+
+      // 确保立即数在 20 位范围内
+      if (imm < -(1 << 19) || imm >= (1 << 20))
+      {
+        throw std::runtime_error("Jump offset out of range for J-type instruction: " + std::to_string(imm));
+      }
+    }
+    else
+    {
+      // 外部符号，添加到重定位表并将偏移量设为 0
+      relocationTable.addRelocation(currentAddress, label, RelocationType::R_RISCV_JAL);
+    }
+
+    uint32_t imm20 = (imm >> 20) & 0x1;     // imm[20]
+    uint32_t imm10_1 = (imm >> 1) & 0x3FF;  // imm[10:1]
+    uint32_t imm11 = (imm >> 11) & 0x1;     // imm[11]
+    uint32_t imm19_12 = (imm >> 12) & 0xFF; // imm[19:12]
+
+    uint32_t instruction = 0;
+    instruction |= (imm20 & 0x1) << 31;     // imm[20]: bit 31
+    instruction |= (imm19_12 & 0xFF) << 12; // imm[19:12]: bits 12-19
+    instruction |= (imm11 & 0x1) << 20;     // imm[11]: bit 20
+    instruction |= (imm10_1 & 0x3FF) << 21; // imm[10:1]: bits 21-30
+    instruction |= (rd & 0x1F) << 7;        // rd: bits 7-11
+    instruction |= (0x6F);                  // opcode: bits 0-6
+
+    return instruction;
+  }
+  else if (expandedOpcode == "jalr")
+  {
+    uint32_t rd = Utils::getRegisterNumber(expandedOperands[0]);
+    uint32_t rs1 = Utils::getRegisterNumber(expandedOperands[1]);
+    int32_t imm = Utils::stringToImmediate(expandedOperands[2]);
+
+    uint32_t instruction = 0x67;        // opcode for jalr
+    instruction |= (rd & 0x1F) << 7;    // rd 位于 7-11 位
+    instruction |= (0x0 & 0x7) << 12;   // funct3 固定为 0
+    instruction |= (rs1 & 0x1F) << 15;  // rs1 位于 15-19 位
+    instruction |= (imm & 0xFFF) << 20; // 偏移量 imm 位于 20-31 位
+
+    return instruction;
+  }
+  else
+  {
+    throw std::runtime_error("Unsupported expanded P-type instruction: " + expandedOpcode);
+  }
+}
+
+接下来我将分别给出不同指令的parseoprand函数和encode函数，请修改他们，以支持百分号，百分号是否可以看作对数据label的引用，只在指令中出现，所以一定会使用重定位表？目前重定位表支持 R_RISCV_HI20 = 26, R_RISCV_LO12_I = 27,R_RR_RISCV_LO12_S = 28,请支持%pcrel等。
+目前百分号在parseLine中初步处理，需要在具体的指令parseoprand函数和encode函数中进一步处理：
+else if (operandStr[index] == '%')
+    {
+      // 处理特殊表达式，例如 %hi(sa)
+      size_t endIndex = index;
+      while (endIndex < operandStr.size() && operandStr[endIndex] != ',' && !isspace(operandStr[endIndex]))
+      {
+        endIndex++;
+      }
+      operand = operandStr.substr(index, endIndex - index);
+      index = endIndex;
+    }
+I型：
+void InstructionI::parseOperands()
+{
+  if (opcode == "jalr")
+  {
+    if (operands.size() != 2)
+    {
+      throw std::runtime_error("Invalid JALR instruction format: " + opcode);
+    }
+
+    // 解析 rd
+    rd = Utils::getRegisterNumber(operands[0]);
+
+    // 解析 offset(rs1)
+    std::string addr = operands[1];
+    size_t pos1 = addr.find('(');
+    size_t pos2 = addr.find(')');
+    if (pos1 == std::string::npos || pos2 == std::string::npos || pos2 <= pos1)
+    {
+      throw std::runtime_error("Invalid address format in JALR instruction: " + operands[1]);
+    }
+
+    std::string immStr = addr.substr(0, pos1);
+    std::string rs1Str = addr.substr(pos1 + 1, pos2 - pos1 - 1);
+
+    // 去除空白字符
+    immStr = Utils::trim(immStr);
+    rs1Str = Utils::trim(rs1Str);
+
+    // 转换偏移量和基址寄存器
+    imm = Utils::stringToImmediate(immStr);
+    rs1 = Utils::getRegisterNumber(rs1Str);
+
+    // 检查立即数偏移量是否为 4 字节对齐
+    if (imm % 4 != 0)
+    {
+      throw std::runtime_error("JALR offset must be 4-byte aligned.");
+    }
+  }
+  else
+  {
+    // 处理其他 I 型指令
+    if (operands.size() != 3)
+    {
+      throw std::runtime_error("Invalid I-type instruction: " + opcode);
+    }
+
+    rd = Utils::getRegisterNumber(operands[0]);
+    rs1 = Utils::getRegisterNumber(operands[1]);
+    imm = Utils::stringToImmediate(operands[2]);
+  }
+}
+
+uint32_t InstructionI::encode(const SymbolTable &symbolTable, RelocationTable &relocationTable,
+                              uint32_t currentAddress, std::string currentSecName)
+{
+  uint32_t opcodeVal = opcodeMap.at(opcode);
+  uint32_t funct3 = funct3Map.at(opcode);
+
+  uint32_t instruction = 0;
+  instruction |= (opcodeVal & 0x7F);
+  instruction |= ((rd & 0x1F) << 7);
+  instruction |= ((funct3 & 0x7) << 12);
+  instruction |= ((rs1 & 0x1F) << 15);
+  instruction |= ((imm & 0xFFF) << 20);
+
+  return instruction;
+}
+B型：
+void InstructionB::parseOperands()
+{
+  if (operands.size() != 3)
+  {
+    throw std::runtime_error("Invalid B-type instruction: " + opcode);
+  }
+
+  // 解析 rs1
+  rs1 = Utils::getRegisterNumber(operands[0]);
+
+  // 解析 rs2
+  rs2 = Utils::getRegisterNumber(operands[1]);
+
+  // 解析 label
+  label = operands[2];
+}
+
+uint32_t InstructionB::encode(const SymbolTable &symbolTable, RelocationTable &relocationTable, uint32_t currentAddress, std::string currentSecName)
+{
+  uint32_t opcodeVal = 0x63; // B 型指令的 opcode 固定为 0x63
+
+  // 获取 funct3
+  auto funct3It = funct3Map.find(opcode);
+  if (funct3It == funct3Map.end())
+  {
+    throw std::runtime_error("Unsupported B-type funct3 for opcode: " + opcode);
+  }
+  uint32_t funct3 = funct3It->second;
+
+  // 检查标签是否在符号表中
+  int32_t imm_shifted = 0;
+
+  if (symbolTable.hasSymbol(label) && currentSecName == symbolTable.getSectionName(label))
+  {
+    // 计算内部符号的偏移量
+    uint32_t labelAddress = symbolTable.getSymbol(label).saddress;
+    imm = static_cast<int32_t>(labelAddress - currentAddress);
+
+    if (imm % 2 != 0)
+    {
+      throw std::runtime_error("Branch target address must be 2-byte aligned.");
+    }
+
+    imm_shifted = imm >> 1;
+
+    if (imm_shifted < -2048 || imm_shifted > 2047)
+    {
+      throw std::runtime_error("Branch offset out of range.");
+    }
+  }
+  else
+  {
+    // 外部符号，添加到重定位表并将偏移量设为0
+    relocationTable.addRelocation(currentAddress, label, RelocationType::R_RISCV_BRANCH);
+  }
+
+  // 将立即数分割为各个部分
+  uint32_t imm12 = (imm_shifted >> 11) & 0x1;   // imm[12]
+  uint32_t imm10_5 = (imm_shifted >> 5) & 0x3F; // imm[10:5]
+  uint32_t imm4_1 = (imm_shifted >> 1) & 0xF;   // imm[4:1]
+  uint32_t imm11 = (imm_shifted >> 10) & 0x1;   // imm[11]
+
+  // 组装指令
+  uint32_t instruction = 0;
+  instruction |= (imm12 & 0x1) << 31;    // imm[12]: bit 31
+  instruction |= (imm10_5 & 0x3F) << 25; // imm[10:5]: bits 25-30
+  instruction |= (rs2 & 0x1F) << 20;     // rs2: bits 20-24
+  instruction |= (rs1 & 0x1F) << 15;     // rs1: bits 15-19
+  instruction |= (funct3 & 0x7) << 12;   // funct3: bits 12-14
+  instruction |= (imm4_1 & 0xF) << 8;    // imm[4:1]: bits 8-11
+  instruction |= (imm11 & 0x1) << 7;     // imm[11]: bit 7
+  instruction |= (opcodeVal & 0x7F);     // opcode: bits 0-6
+
+  return instruction;
+}
+
+
+我现在理解到ELF文件有两个用途，一个是链接，一个是执行。对于链接，ELF文件包含ELF header section table header和section，而这里的section似乎是指的项目中的segment，即.text .data等。那么，我之前实现的section内的地址计算是否有问题，这个地址是否实际指segment内地址？在给出的许多教程中，似乎并未提到符号表和重定位表，这些该怎么处理？使用libelf，riscv32im，我确实难以完成完整的商用汇编器，请基于我的项目给出可用的教学用ELFwriter
+
+
+你忘记了整体流程，没有区分项目的section和elf的section的定义，对于项目的section，有属于.text的factorial，main两个section，他们的地址分别计算，还有sa(.sdata),se(.sdata),sb(.rodata),sc(.rodata)，由于汇编结构，项目的section在读到.type时设置，最终，我将填充好的section插入secsegTable，segment更像是elf中的seection，下面给出我的实现：
+#ifndef SECTION_HPP
+#define SECTION_HPP
+
+#include <string>
+#include <vector>
+#include <cstdint>
+#include <stdexcept>
+
+class Section
+{
+public:
+  // 构造函数，初始化段的名称、对齐、标志和类型
+  Section(const std::string &name);
+
+  // 添加数据到段
+  void addData(const std::vector<uint8_t> &data);
+
+  // 添加一条机器码指令（32位）
+  void addInstruction(std::vector<uint32_t> &instructions);
+
+  // 对齐段内容
+  void align(uint32_t alignment);
+
+  // 获取段的名称
+  const std::string &getName() const;
+
+  // 获取段的数据内容
+  const std::vector<uint8_t> &getData() const;
+
+  // 获取段的对齐值
+  uint32_t getAlignment() const;
+
+  // 获取段的标志
+  const std::string &getFlags() const;
+
+  // 获取段的类型
+  const std::string &getType() const;
+
+  const std::string &getSegmentName() const;
+
+  // 获取段的大小
+  uint32_t getSize() const;
+
+public:
+  void setName(const std::string &name);
+  void setAlignment(uint32_t alignment);
+  void setFlags(const std::string &flags);
+  void setType(const std::string &type);
+  void setSegmentName(const std::string &segmentName);
+  void setSectionSize(uint32_t size);
+  void setFillValue(uint8_t fillValue);
+  void setBaseAddress(uint32_t baseAddress);
+
+private:
+  std::string name;           // 段名称
+  uint32_t alignment;         // 段对齐
+  uint8_t fillValue;          // 填充值
+  std::string flags;          // 段标志
+  std::string type;           // 段类型
+  std::string segmentName;    // 段所属节的名称
+  std::uint32_t section_size; // 段大小
+  std::vector<uint8_t> data;  // 段数据
+  uint32_t baseAddress;       // 段的基地址
+};
+
+#endif // SECTION_HPP
+#ifndef ASSEMBLER_HPP
+#define ASSEMBLER_HPP
+
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include "../symbol_table/SymbolTable.hpp"
+#include "../relocation_table/RelocationTable.hpp"
+#include "../instruction/Instruction.hpp"
+#include "../relocation_table/RelocationTable.hpp"
+#include "../elf_writer/ElfWriter.hpp"
+#include "../section/Section.hpp"
+
+class Assembler
+{
+public:
+  void assemble(const std::string &inputFile, const std::string &outputFile);
+
+private:
+  void firstPass();
+  void secondPass();
+  void writeElfFile(const std::string &outputFile);
+  std::vector<std::string> readAssemblyCode(const std::string &filename);
+  void initializeSegments();
+
+private:
+  void handleTypeDirective(std::istringstream &iss, std::string &currentSecName);
+  void Assembler::handleGloblDirective(std::istringstream &iss);
+  void handleSectionDirective(std::istringstream &iss, std::string &currentSecName);
+  void handleP2AlignDirective(std::istringstream &iss, const std::string &currentSecName);
+  void handleSizeDirective(std::istringstream &iss, const std::string &currentSecName);
+  void handleWordDirective(std::istringstream &iss, const std::string &currentSecName);
+  void handleAscizDirective(std::istringstream &iss, const std::string &currentSecName);
+  void handleInstruction(const int address, const std::string &line, const std::string &currentSecName);
+  void handleSegmentTable();
+  // 哈希表1：sec_name -> Section
+  std::unordered_map<std::string, Section> sectionTable;
+
+  // 哈希表2：段名 -> vector<Section>
+  std::unordered_map<std::string, std::vector<Section>> segSecTable;
+
+  std::unordered_map<std::string, std::vector<std::pair<int, std::string>>> instructionTable;
+  // std::unordered_map<std::string, std::vector<std::string>> secSymbolTable;
+
+  std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> baseAddressTable;
+
+  SymbolTable symbolTable;
+  RelocationTable relocationTable;
+  RelocationTable relocationTable;
+  std::string currentSecName;
+  std::vector<std::string> lines; // 汇编代码的行集合
+  uint32_t saddress = 0;
+  uint32_t gaddress = 0;
+};
+
+#endif // ASSEMBLER_HPP
+
+
+
+	.text
+	.attribute	4, 16
+	.attribute	5, "rv32i2p1_m2p0_zmmul1p0"
+	.file	"main.c"
+	.globl	factorial                       # -- Begin function factorial
+	.p2align	2
+	.type	factorial,@function
+factorial:                              # @factorial
+# %bb.0:
+	j	.LBB0_1
+.LBB0_1:                                # =>This Inner Loop Header: Depth=1
+	j	.LBB0_2
+.LBB0_2:                                #   in Loop: Header=BB0_1 Depth=1
+	j	.LBB0_3
+.LBB0_3:                                #   in Loop: Header=BB0_1 Depth=1
+	j	.LBB0_1
+.LBB0_4:
+	ret
+.Lfunc_end0:
+	.size	factorial, .Lfunc_end0-factorial
+                                        # -- End function
+	.globl	main                            # -- Begin function main
+	.p2align	2
+	.type	main,@function
+main:                                   # @main
+# %bb.0:
+	addi	sp, sp, 48
+	ret
+.Lfunc_end1:
+	.size	main, .Lfunc_end1-main
+                                        # -- End function
+	.type	sa,@object                      # @sa
+	.section	.sdata,"aw",@progbits
+	.globl	sa
+	.p2align	2, 0x0
+sa:
+	.word	100                             # 0x64
+	.size	sa, 4
+
+	.type	se,@object                 
+	.section	.sdata,"aw",@progbits
+	.globl	se
+	.p2align	2, 0x0
+se:
+	.word	10                             # 0x64
+	.size	se, 4
+
+	.type	sb,@object                      # @sb
+	.section	.rodata,"a",@progbits
+	.p2align	2, 0x0
+sb:
+	.word	20                              # 0x14
+	.size	sb, 4
+
+	.type	sc,@object                      # @sc
+	.data
+sc:
+	.asciz	"gfhsdfg\000\000\000\000\000\000\000\000\000\000\000\000"
+	.size	sc, 20
+
+	.type	.L__const.main.a,@object        # @__const.main.a
+	.section	.rodata,"a",@progbits
+.L__const.main.a:
+	.asciz	"asdfg\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
+	.size	.L__const.main.a, 20
+
+	.ident	"Homebrew clang version 19.1.3"
+	.section	".note.GNU-stack","",@progbits
+	.addrsig
+	.addrsig_sym factorial
+	.addrsig_sym sa
+	.addrsig_sym sb
+	.addrsig_sym sc
+
+梳理一下，在遍历时，gaddress的作用是遍历到指令等增加，以便在.size处计算size，saddress的粒度不是函数和变量，而是针对不同的段，如.text，.data，是这样吗。下面以section和段分别指代项目中的section和elf section，整体流程是这样的：firstpass中， 遇到.type，设置新section，遇到.section，新增一个数据结构存储各个段的saddress，遇到.size，根据gaddress计算大小，遇到symbol，记录所属段和saddress，遇到指令，记录所属段和saddress，记录在std::unordered_map<std::string, std::vector<std::pair<int, std::string>>> instructionTable。一个新增的改动是，对于非.text的段，可否在这个时候处理其中各个section的baseaddr，这样也可以较好的处理symboltable，正确处理其地址，接下来secondpass中，处理指令，根据symboltable判断是否需要计算相对地址或者 视为重定位，处理后将其插入至section中
+
+
+在addToShStrTab和addToStrTab中push_back(0)是否与.asciz中处理字符串，在结尾加\0重复：
+void Assembler::handleAscizDirective(std::istringstream &iss, const std::string &currentSecName)
+{
+  std::string strValue;
+  std::getline(iss, strValue); // 获取字符串内容（包含引号）
+
+  // 去掉首尾的引号，得到实际字符串内容
+  if (strValue.size() >= 2 && strValue.front() == '"' && strValue.back() == '"')
+  {
+    strValue = strValue.substr(1, strValue.size() - 2);
+  }
+
+  std::vector<uint8_t> data;
+
+  // 逐个字符解析字符串内容，处理转义字符
+  for (size_t i = 0; i < strValue.size(); ++i)
+  {
+    if (strValue[i] == '\\')
+    {
+      // 处理转义字符
+      if (i + 1 < strValue.size())
+      {
+        if (strValue[i + 1] == '0')
+        {
+          // 处理 \000 格式
+          int zeroCount = 0;
+          size_t j = i + 1;
+          while (j < strValue.size() && strValue[j] == '0' && zeroCount < 3)
+          {
+            zeroCount++;
+            j++;
+          }
+          data.push_back('\0');
+          i += zeroCount; // 跳过已经处理的字符
+        }
+        else
+        {
+          // 处理其他单字符转义，如 \n, \t, \\ 等
+          switch (strValue[i + 1])
+          {
+          case 'n':
+            data.push_back('\n');
+            break;
+          case 't':
+            data.push_back('\t');
+            break;
+          case '\\':
+            data.push_back('\\');
+            break;
+          case '\"':
+            data.push_back('\"');
+            break;
+          default:
+            throw std::runtime_error("Unknown escape sequence in .asciz directive");
+          }
+          i++; // 跳过转义字符
+        }
+      }
+    }
+    else
+    {
+      // 非转义字符直接添加
+      data.push_back(static_cast<uint8_t>(strValue[i]));
+    }
+  }
+
+  // 保证结尾有一个 '\0' 字节作为终止符
+  if (data.empty() || data.back() != '\0')
+  {
+    data.push_back('\0');
+  }
+
+  // 将解析后的数据添加到当前 section
+  sectionTable[currentSecName].addData(data);
+
+  // 更新地址，增加数据长度
+  saddress += data.size();
+  gaddress += data.size();
+
+  sectionTable[currentSecName].align(sectionTable[currentSecName].getAlignment(), saddress, gaddress);
+}
+是否存在对齐，symbol和address的重复更新，参考assembler主干的实现，按理这些在主干都处理好了，还是说，因为elf各种头部的处理需要重新修改计算：
+// assembler/Assembler.cpp
+
+#include "Assembler.hpp"
+#include <fstream>
+#include <sstream>
+#include "../utils/Utils.hpp"
+
+void Assembler::initializeSegments()
+{
+  segSecTable[".text"] = {};
+  segSecTable[".data"] = {};
+  segSecTable[".rodata"] = {};
+  segSecTable[".sdata"] = {};
+  segSecTable[".bss"] = {};
+  segAddressTable[".text"] = 0;
+  segAddressTable[".data"] = 0;
+  segAddressTable[".rodata"] = 0;
+  segAddressTable[".sdata"] = 0;
+  segAddressTable[".bss"] = 0;
+  baseAddressTable[".text"] = std::make_pair(0, 0);
+  baseAddressTable[".data"] = std::make_pair(0, 0);
+  baseAddressTable[".rodata"] = std::make_pair(0, 0);
+  baseAddressTable[".sdata"] = std::make_pair(0, 0);
+  baseAddressTable[".bss"] = std::make_pair(0, 0);
+}
+
+// 组装整个流程
+void Assembler::assemble(const std::string &inputFile, const std::string &outputFile)
+{
+  lines = readAssemblyCode(inputFile); // 读取文件中的汇编行
+  firstPass();
+  secondPass();
+  writeElfFile(outputFile);
+}
+
+// 封装的写入 ELF 文件的函数
+void Assembler::writeElfFile(const std::string &outputFile)
+{
+  // ElfWriter elfWriter(outputFile);
+  // elfWriter.addTextSection(textSegment);
+  // elfWriter.addDataSection(dataSegment);
+  // elfWriter.addRodataSection(rodataSegment);
+  // elfWriter.writeSymbolTable(symbolTable);
+  // elfWriter.writeRelocationTable(relocationTable);
+  // elfWriter.finalize();
+}
+
+// 读取文件的每一行
+std::vector<std::string> Assembler::readAssemblyCode(const std::string &filename)
+{
+  std::ifstream infile(filename);
+  std::vector<std::string> lines;
+  std::string line;
+
+  while (std::getline(infile, line))
+  {
+    // 删除行内注释
+    size_t commentPos = line.find('#');
+    if (commentPos != std::string::npos)
+    {
+      line = line.substr(0, commentPos); // 保留注释前的内容
+    }
+
+    line = Utils::trim(line);
+    if (!line.empty())
+    {
+      lines.push_back(line);
+    }
+  }
+  return lines;
+}
+
+// std::string name;           // 段名称
+// uint32_t alignment;         // 段对齐
+// std::string flags;          // 段标志
+// std::string type;           // 段类型
+// std::string segmentName;    // 段所属节的名称
+// std::uint32_t section_size; // 段大小
+// std::vector<uint8_t> data;  // 段数据
+void Assembler::firstPass()
+{
+  initializeSegments();
+
+  for (const auto &line : lines)
+  {
+    if (line.back() == ':')
+    { // 处理标签
+      std::string label = line.substr(0, line.size() - 1);
+      if (!symbolTable.hasSymbol(label))
+      {
+        symbolTable.addSymbol(label, saddress, gaddress, SymbolType::LABEL, false, currentSecName);
+      }
+      else
+      {
+        symbolTable.updateSymbolAddress(label, saddress, gaddress);
+        symbolTable.setType(label, SymbolType::LABEL);
+        symbolTable.setSectionName(label, currentSecName);
+        auto segName = sectionTable[currentSecName].getSegmentName();
+        symbolTable.setSegmentName(label, segName);
+      }
+    }
+    else if (line[0] == '.')
+    { // 处理伪指令
+      std::istringstream iss(line);
+      std::string directive;
+      iss >> directive;
+      if (directive == ".text")
+      {
+        isText = true;
+        saddress = segAddressTable[".text"];
+      }
+      if (directive == ".type")
+      {
+        handleTypeDirective(iss, currentSecName);
+      }
+      else if (directive == ".globl")
+      {
+        handleGloblDirective(iss);
+      }
+      else if (directive == ".section")
+      {
+        handleSectionDirective(iss, currentSecName);
+      }
+      else if (directive == ".p2align")
+      {
+        handleP2AlignDirective(iss, currentSecName);
+      }
+      else if (directive == ".size")
+      {
+        handleSizeDirective(iss, currentSecName);
+      }
+      else if (directive == ".word")
+      {
+        handleWordDirective(iss, currentSecName);
+      }
+      else if (directive == ".asciz")
+      {
+        handleAscizDirective(iss, currentSecName);
+      }
+    }
+    else
+    {
+      std::pair<int, std::string> instrucionPair = std::make_pair(saddress, line);
+      instructionTable[currentSecName].emplace_back(instrucionPair);
+      saddress += 4;
+      gaddress += 4;
+    }
+  }
+}
+
+void Assembler::secondPass()
+{
+  for (auto &instr : instructionTable)
+  {
+    std::string secName = instr.first;
+    std::vector<std::pair<int, std::string>> instructionPair = instr.second;
+    for (auto &pair : instructionPair)
+    {
+      int address = pair.first;
+      std::string line = pair.second;
+      handleInstruction(address, line, secName);
+    }
+  }
+  handleSegmentTable();
+}
+
+void Assembler::handleTypeDirective(std::istringstream &iss, std::string &currentSecName)
+{
+  //.type	factorial,@function
+  // 读取 .type 后面的整行内容
+  std::string restOfLine;
+  std::getline(iss, restOfLine);
+
+  // 去除首尾空白
+  restOfLine = Utils::trim(restOfLine);
+
+  // 使用 split 函数按逗号分割
+  std::vector<std::string> parts = Utils::split(restOfLine, ',');
+
+  // 检查分割结果是否有效
+  if (parts.size() != 2)
+  {
+    if (parts.size() != 2)
+    {
+      throw std::runtime_error("Invalid format in .type directive: " + restOfLine);
+    }
+  }
+  currentSecName = Utils::trim(parts[0]);
+  std::string type = Utils::trim(parts[1]);
+
+  // 设置符号类型
+  if (type == "@function" || type == "@object")
+  {
+    if (sectionTable.find(currentSecName) == sectionTable.end())
+    {
+      sectionTable[currentSecName] = Section(currentSecName);
+      if (type == "@function")
+      {
+        sectionTable[currentSecName].setSegmentName(".text");
+        sectionTable[currentSecName].setAlignment(1 << 2);
+        sectionTable[currentSecName].setFillValue(0x0);
+      }
+      else
+      {
+        isText = false;
+      }
+    }
+    else
+    {
+      throw std::runtime_error("Section already exists");
+    }
+  }
+  else
+  {
+    throw std::runtime_error("Unknown symbol type in .type directive: " + type);
+  }
+}
+
+void Assembler::handleGloblDirective(std::istringstream &iss)
+{
+  std::string symbol;
+  if (!(iss >> symbol))
+  {
+    throw std::runtime_error("Invalid format in .globl directive");
+  }
+  if (!symbolTable.hasSymbol(symbol))
+  {
+    symbolTable.addSymbol(symbol);
+  }
+  symbolTable.setGlobal(symbol, true);
+}
+
+void Assembler::handleSectionDirective(std::istringstream &iss, std::string &currentSecName)
+{
+  //.section	.rodata,"a",@progbits
+  // 读取 .section 后的所有内容
+  std::string restOfLine;
+  std::getline(iss, restOfLine);
+  restOfLine = Utils::trim(restOfLine);
+
+  // 分割成节名、标志、类型
+  std::vector<std::string> sectionParts = Utils::split(restOfLine, ',');
+
+  if (sectionParts.size() < 1)
+  {
+    throw std::runtime_error("Invalid .section directive format: " + restOfLine);
+  }
+
+  // 解析节名
+  std::string segmentName = Utils::trim(sectionParts[0]);
+  // 解析标志和类型，如果有的话
+  std::string flags = (sectionParts.size() > 1) ? Utils::trim(sectionParts[1]) : "";
+  std::string type = (sectionParts.size() > 2) ? Utils::trim(sectionParts[2]) : "";
+  sectionTable[currentSecName].setSegmentName(segmentName);
+  sectionTable[currentSecName].setFlags(flags);
+  sectionTable[currentSecName].setType(type);
+  saddress = segAddressTable[segmentName];
+}
+
+void Assembler::handleP2AlignDirective(std::istringstream &iss, const std::string &currentSecName)
+{
+  // 获取对齐参数行，并去除多余空格
+  std::string restOfLine;
+  std::getline(iss, restOfLine);
+  if (!isText)
+  {
+    restOfLine = Utils::trim(restOfLine);
+
+    // 分割参数，去除空白
+    auto alignArgs = Utils::split(restOfLine, ',');
+
+    if (alignArgs.empty())
+    {
+      throw std::runtime_error("Missing alignment value in .p2align directive");
+    }
+
+    int align = std::stoi(Utils::trim(alignArgs[0]));
+    uint8_t fillValue = (alignArgs.size() > 1) ? std::stoi(Utils::trim(alignArgs[1]), nullptr, 0) : 0;
+
+    if (align < 0 || align > 31)
+    {
+      throw std::runtime_error("Invalid alignment value in .p2align directive: " + std::to_string(align));
+    }
+
+    // address = Utils::alignAddress(address, 1 << align);
+    sectionTable[currentSecName].setAlignment(1 << align);
+    sectionTable[currentSecName].setFillValue(fillValue);
+  }
+}
+
+void Assembler::handleSizeDirective(std::istringstream &iss, const std::string &currentSecName)
+{
+  // 读取符号名称和大小部分
+  std::string sizeLine;
+  std::getline(iss, sizeLine);                                      // 获取完整的行内容
+  std::vector<std::string> sizeParts = Utils::split(sizeLine, ','); // 按逗号分割
+  if (sizeParts.size() != 2 || sizeParts[0] != currentSecName)
+  {
+    throw std::runtime_error("Invalid format in .size directive for: " + currentSecName);
+  }
+
+  std::string symbol = sizeParts[0];
+  std::string sizeExpr = sizeParts[1];
+
+  if (sizeExpr.find('-') != std::string::npos)
+  {
+    // 表达式格式，分割并计算
+    std::vector<std::string> exprParts = Utils::split(sizeExpr, '-');
+    if (exprParts.size() == 2)
+    {
+      std::string startSymbol = exprParts[0];
+      std::string endSymbol = exprParts[1];
+
+      // 获取符号地址并计算差值
+      uint32_t startAddr = symbolTable.getSymbol(startSymbol).getGAddress();
+      uint32_t endAddr = symbolTable.getSymbol(endSymbol).getGAddress();
+      uint32_t size = startAddr - endAddr;
+
+      symbolTable.setSize(symbol, size);
+      sectionTable[currentSecName].setSectionSize(size);
+    }
+    else
+    {
+      // 直接数值
+      int size = std::stoi(sizeExpr);
+      symbolTable.setSize(symbol, size);
+      sectionTable[currentSecName].setSectionSize(size);
+    }
+    sectionTable[currentSecName].align(sectionTable[currentSecName].getAlignment(), saddress, gaddress);
+    uint32_t prevBaseAddress = baseAddressTable[sectionTable[currentSecName].getSegmentName()].first;
+    uint32_t prevSize = baseAddressTable[sectionTable[currentSecName].getSegmentName()].second;
+    sectionTable[currentSecName].setBaseAddress(prevBaseAddress + prevSize);
+    baseAddressTable[sectionTable[currentSecName].getSegmentName()].first = prevBaseAddress + prevSize;
+    baseAddressTable[sectionTable[currentSecName].getSegmentName()].second = sectionTable[currentSecName].getSize();
+    segAddressTable[sectionTable[currentSecName].getSegmentName()] = saddress;
+  }
+}
+
+void Assembler::handleWordDirective(std::istringstream &iss, const std::string &currentSecName)
+{
+  uint32_t value;
+  std::vector<uint32_t> data;
+  while (iss >> value) // 读取每个32位整数值
+  {
+    // 将值按小端序添加到段数据
+    data.emplace_back(value);
+    sectionTable[currentSecName].addInstruction(data);
+    saddress += 4;
+    gaddress += 4;
+  }
+}
+void Assembler::handleAscizDirective(std::istringstream &iss, const std::string &currentSecName)
+{
+  std::string strValue;
+  std::getline(iss, strValue); // 获取字符串内容（包含引号）
+
+  // 去掉首尾的引号，得到实际字符串内容
+  if (strValue.size() >= 2 && strValue.front() == '"' && strValue.back() == '"')
+  {
+    strValue = strValue.substr(1, strValue.size() - 2);
+  }
+
+  std::vector<uint8_t> data;
+
+  // 逐个字符解析字符串内容，处理转义字符
+  for (size_t i = 0; i < strValue.size(); ++i)
+  {
+    if (strValue[i] == '\\')
+    {
+      // 处理转义字符
+      if (i + 1 < strValue.size())
+      {
+        if (strValue[i + 1] == '0')
+        {
+          // 处理 \000 格式
+          int zeroCount = 0;
+          size_t j = i + 1;
+          while (j < strValue.size() && strValue[j] == '0' && zeroCount < 3)
+          {
+            zeroCount++;
+            j++;
+          }
+          data.push_back('\0');
+          i += zeroCount; // 跳过已经处理的字符
+        }
+        else
+        {
+          // 处理其他单字符转义，如 \n, \t, \\ 等
+          switch (strValue[i + 1])
+          {
+          case 'n':
+            data.push_back('\n');
+            break;
+          case 't':
+            data.push_back('\t');
+            break;
+          case '\\':
+            data.push_back('\\');
+            break;
+          case '\"':
+            data.push_back('\"');
+            break;
+          default:
+            throw std::runtime_error("Unknown escape sequence in .asciz directive");
+          }
+          i++; // 跳过转义字符
+        }
+      }
+    }
+    else
+    {
+      // 非转义字符直接添加
+      data.push_back(static_cast<uint8_t>(strValue[i]));
+    }
+  }
+
+  // 保证结尾有一个 '\0' 字节作为终止符
+  if (data.empty() || data.back() != '\0')
+  {
+    data.push_back('\0');
+  }
+
+  // 将解析后的数据添加到当前 section
+  sectionTable[currentSecName].addData(data);
+
+  // 更新地址，增加数据长度
+  saddress += data.size();
+  gaddress += data.size();
+
+  sectionTable[currentSecName].align(sectionTable[currentSecName].getAlignment(), saddress, gaddress);
+}
+void Assembler::handleInstruction(const int address, const std::string &line, const std::string &currentSecName)
+{
+  // 使用 Instruction 工厂方法解析并创建指令对象
+  auto instruction = Instruction::create(line);
+
+  // 编码指令，生成机器码
+  std::vector<uint32_t> machineCode = instruction->encode(symbolTable, relocationTable, sectionTable, address, currentSecName);
+
+  // 将机器码添加到当前节的数据
+  sectionTable[currentSecName].addInstruction(machineCode);
+}
+
+void Assembler::handleSegmentTable()
+{
+  for (const auto &sec : sectionTable)
+  {
+    const std::string &secName = sec.first;
+    const Section &section = sec.second;
+    const std::string &segmentName = section.getSegmentName();
+    segSecTable[segmentName].push_back(section);
+  }
+}
